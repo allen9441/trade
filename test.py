@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import pandas as pd
@@ -7,20 +8,13 @@ from datetime import datetime
 from data.loader import DataLoader
 from models.lstm import LSTMTrader
 from engine.backtest import BacktestEngine
+from config import (
+    TICKERS, FEATURES, INITIAL_CAPITAL, SEQUENCE_LENGTH,
+    NUM_ENSEMBLE_MODELS, DEFAULT_EPOCHS, DEFAULT_BATCH_SIZE, DEFAULT_LEARNING_RATE,
+    BASE_DIR,
+)
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-TICKERS = [
-    "0050.TW", "0056.TW", "00878.TW", "00929.TW",
-    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2881.TW",
-    "2882.TW", "2891.TW", "2886.TW", "1301.TW", "1303.TW", "2002.TW",
-    "2884.TW", "2892.TW", "1216.TW", "2303.TW", "3711.TW", "2885.TW",
-    "2880.TW", "3231.TW", "3045.TW", "2883.TW", "5871.TW", "2887.TW",
-    "2395.TW", "2412.TW", "2890.TW", "5880.TW", "1101.TW", "2357.TW",
-    "2301.TW", "2912.TW", "1326.TW", "2603.TW", "2207.TW", "1304.TW",
-    "2324.TW", "6669.TW", "3034.TW", "4938.TW", "3037.TW", "2345.TW",
-    "2356.TW", "1590.TW", "5876.TW", "4904.TW", "2379.TW"
-]
 
 def format_date(date_str):
     try:
@@ -42,6 +36,9 @@ def main():
     enable_short_input = input("Enable Short Selling? (T/F) [Default: F]: ").strip().upper()
     enable_short = True if enable_short_input == 'T' else False
     
+    parallel_training_input = input("Enable Parallel Multi-Model Training? (T/F) [Default: T]: ").strip().upper()
+    parallel_training = False if parallel_training_input == 'F' else True
+    
     train_start = format_date(train_start_input)
     train_end = format_date(train_end_input)
     test_buffer_start = format_date(test_buffer_start_input)
@@ -53,17 +50,11 @@ def main():
     print(f"Testing Period:  {test_start} to {test_end} (Buffer from: {test_buffer_start})")
     print(f"Initial Capital: $1,000,000 TWD")
     print(f"Short Selling:   {'Enabled' if enable_short else 'Disabled'}")
+    print(f"Training Mode:   {'Parallel' if parallel_training else 'Sequential'}")
     print("==================================================\n")
     
     loader = DataLoader()
-    features = [
-        'Open', 'Close', 'High', 'Low',
-        'Body_Size', 'Daily_Range',
-        'SMA_5', 'SMA_20', 'SMA_60', 'RSI', 
-        'MACD', 'MACD_Signal', 'MACD_Hist',
-        'BB_Upper', 'BB_Lower', 'BB_Width', 'OBV',
-        'Vol_Change', 'TWII_Return', 'TWII_Volume', 'SP500_Return'
-    ]
+    features = FEATURES
     
     # 1. 準備訓練集
     print("[1] Fetching Training Data...")
@@ -93,9 +84,9 @@ def main():
     df_train.sort_values(by='Date', inplace=True)
     
     # 2. 訓練模型
-    print(f"\n[2] Training 10-Model Ensemble (This will take a while)...")
-    trader = LSTMTrader(sequence_length=20, features=features)
-    trader.train(df_train, epochs=20, batch_size=256)
+    print(f"\n[2] Training {NUM_ENSEMBLE_MODELS}-Model Ensemble (This will take a while)...")
+    trader = LSTMTrader(sequence_length=SEQUENCE_LENGTH, features=features)
+    trader.train(df_train, epochs=DEFAULT_EPOCHS, batch_size=DEFAULT_BATCH_SIZE, learning_rate=DEFAULT_LEARNING_RATE, parallel=parallel_training)
     
     # 3. 準備測試集並產生信號
     print("\n[3] Fetching Testing Data & Voting...")
@@ -105,7 +96,6 @@ def main():
     raw_test_data = {}
     
     for ticker in TICKERS:
-        # 同樣需要擷取測試期間前的數據來計算技術指標，確保模型能夠生成信號
         df = loader.fetch_data(ticker, test_buffer_start, test_end)
         if df.empty or len(df) < 30: continue
         df['Vol_Change'] = df['Volume'].pct_change()
@@ -121,6 +111,10 @@ def main():
         
         # 生成信號
         df_scored = trader.generate_signals(df)
+        
+        # 計算預測真實目標
+        df_scored['Future_Return'] = df_scored['Close'].pct_change().shift(-1)
+        df_scored['True_Target'] = (df_scored['Future_Return'] > 0.002).astype(int)
         
         # 模型在 T 日收盤後產生訊號，在 T+1 日執行交易。
         df_scored['Position'] = df_scored['Position'].shift(1)
@@ -139,6 +133,44 @@ def main():
         
     # 合併所有測試信號並準備價格矩陣
     df_test_combined = pd.concat(test_signals.values(), ignore_index=True)
+    
+    # 評估預測指標 (ROC-AUC, Precision, Histogram)
+    print("\n[3.5] Evaluating Model Predictions...")
+    df_eval_metrics = df_test_combined.dropna(subset=['lstm_prob_smooth', 'True_Target', 'Future_Return', 'signal'])
+    
+    if not df_eval_metrics.empty:
+        from sklearn.metrics import roc_auc_score, precision_score
+        import matplotlib.pyplot as plt
+        
+        y_true = df_eval_metrics['True_Target']
+        y_prob = df_eval_metrics['lstm_prob_smooth']
+        # 使用 Position == 1.0（實際觸發買入的時刻）作為預測正例，
+        # 而非 signal == 1.0（持續性狀態信號），才能正確反映
+        # 「每次觸發買入時，隔天確實漲超 0.2% 的比例」
+        y_pred = (df_eval_metrics['Position'] == 1.0).astype(int)
+        
+        try:
+            roc_auc = roc_auc_score(y_true, y_prob)
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            n_buy_signals = y_pred.sum()
+            print(f"ROC-AUC Score:  {roc_auc:.4f}")
+            print(f"Precision (Buy triggers): {precision:.4f} ({n_buy_signals} buy signals)")
+            
+            # 繪製機率分佈直方圖
+            plt.figure(figsize=(10, 6))
+            plt.hist(y_prob, bins=50, alpha=0.7, color='blue', edgecolor='black')
+            plt.title('Distribution of Predicted Probabilities (Test Period)')
+            plt.xlabel('Predicted Probability of > 0.2% Gain')
+            plt.ylabel('Frequency')
+            plt.axvline(x=np.median(y_prob), color='r', linestyle='--', label=f'Median ({np.median(y_prob):.4f})')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            hist_path = os.path.join(BASE_DIR, 'models', 'pred_prob_hist.png')
+            plt.savefig(hist_path)
+            print("Prediction probability histogram is saved.")
+            plt.close()
+        except Exception as e:
+            print(f"Warning: Could not calculate metrics. {e}")
     df_test_combined.sort_values(by='Date', inplace=True)
     
     # 準備價格矩陣，確保每個日期都有所有股票的價格（使用前向填充處理缺失值）
@@ -161,8 +193,13 @@ def main():
         action = None
         quantity = 0
         
+        position = row.get('Position')
+        # Position 可能為 NaN，需先檢查
+        if pd.isna(position):
+            return action, quantity
+        
         # 根據投票結果決定買賣行為：1.0 為買入/回補信號，-1.0 為賣出/放空信號
-        if row.get('Position') == 1.0:
+        if position == 1.0:
             if current_position < 0:
                 # 之前有放空，現在有買入信號，所以回補
                 action = 'COVER'
@@ -173,7 +210,7 @@ def main():
                 alloc = current_capital * 0.20 
                 quantity = int(alloc // current_price)
             
-        elif row.get('Position') == -1.0:
+        elif position == -1.0:
             if current_position > 0:
                 # 之前有買多，現在有賣出信號，所以賣出平倉
                 action = 'SELL'
@@ -186,7 +223,7 @@ def main():
             
         return action, quantity
 
-    engine = BacktestEngine(initial_capital=1000000.0)
+    engine = BacktestEngine(initial_capital=INITIAL_CAPITAL)
     metrics = engine.run_daily_batch(df_test_combined, ensemble_strategy, price_matrix)
     
     # 5. 最終結果
@@ -198,6 +235,7 @@ def main():
     print(f"Total Net Profit:       ${metrics['Total_Net_Profit']:,.2f}")
     print(f"Total Return:           {metrics['Total_Return_Pct']:.2f}%")
     print(f"Max Drawdown:           {metrics['Max_Drawdown_Pct']:.2f}%")
+    print(f"Sharpe Ratio:           {metrics['Sharpe_Ratio']:.4f}")
     print(f"Win Rate:               {metrics['Win_Rate_Pct']:.2f}%")
     print(f"Total Trades Executed:  {metrics['Total_Trades']}")
     print(f"Total Fees Paid:        ${metrics['Total_Fees_Paid']:,.2f}")
@@ -211,7 +249,6 @@ def main():
         if m['Trades'] > 0:
             print(f"{ticker:<8} | Trades: {m['Trades']:<3} | Profit: ${m['Net_Profit']:>9,.2f} | Fees: ${m['Fees_Paid']:>7,.2f}")
             
-    print("\n[Trade History (First 10 & Last 10)]")
     history = metrics['Trade_History']
     
     try:
@@ -220,22 +257,6 @@ def main():
         print("Trade history saved to testlog.json")
     except Exception as e:
         print(f"Failed to save trade history: {e}")
-
-    if not history:
-        print("No trades executed.")
-    else:
-        df_hist = pd.DataFrame(history)
-        df_hist['Value'] = df_hist['Price'] * df_hist['Quantity']
-        display_cols = ['Date', 'Ticker', 'Action', 'Price', 'Quantity', 'Value', 'Fee']
-        
-        if len(df_hist) <= 20:
-            print(df_hist[display_cols].to_string(index=False))
-        else:
-            print(df_hist[display_cols].head(10).to_string(index=False))
-            print("...")
-            print(df_hist[display_cols].tail(10).to_string(index=False))
-            
-    print("==================================================\n")
 
 if __name__ == "__main__":
     main()

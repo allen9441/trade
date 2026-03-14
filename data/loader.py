@@ -59,10 +59,10 @@ class DataLoader:
         df['SMA_20'] = df['Close'].rolling(window=20).mean()
         df['SMA_60'] = df['Close'].rolling(window=60).mean()
         
-        # 相對強弱指標 (RSI)
+        # 相對強弱指標 (RSI) — 使用 Wilder's EMA
         delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan)
         df['RSI'] = 100 - (100 / (1 + rs))
         
@@ -92,8 +92,10 @@ class DataLoader:
         return df
 
     def fetch_market_index(self, start_date: str, end_date: Optional[str] = None) -> pd.DataFrame:
-        """擷取市場指數（例如台灣加權指數 ^TWII 和 S&P 500 ^GSPC）的歷史數據，並計算相關特徵。"""
-        print(f"Fetching Market Indices (^TWII, ^GSPC) from {start_date} to {end_date}...")
+        """擷取市場指數的歷史數據，並計算相關特徵。"""
+        print(f"Fetching Market Indices from {start_date} to {end_date}...")
+        twii = pd.DataFrame()
+        sp500 = pd.DataFrame()
         try:
             # TWII
             twii = yf.download("^TWII", start=start_date, end=end_date, progress=False)
@@ -113,14 +115,21 @@ class DataLoader:
                 sp500 = sp500[['Date', 'Close']].rename(columns={'Close': 'SP500_Close'})
                 sp500['SP500_Return'] = sp500['SP500_Close'].pct_change()
             
-            # merge
+            # merge — 以台股交易日為基準，left join S&P 500
+            # S&P 500 與台股交易日不完全同步（時區、假日不同），
+            # 使用 ffill + bfill 確保首尾都不會因缺值被 dropna 丟棄。
             if not twii.empty and not sp500.empty:
-                market_df = pd.merge(twii, sp500, on='Date', how='inner')
+                market_df = pd.merge(twii, sp500, on='Date', how='left')
+                sp500_cols = ['SP500_Close', 'SP500_Return']
+                market_df[sp500_cols] = market_df[sp500_cols].ffill().bfill()
             elif not twii.empty:
                 market_df = twii
+            elif not sp500.empty:
+                market_df = sp500
             else:
-                market_df = pd.DataFrame()
-                
+                print("Warning: Both TWII and S&P 500 data are empty.")
+                return pd.DataFrame()
+
             market_df.dropna(inplace=True)
             return market_df
         except Exception as e:

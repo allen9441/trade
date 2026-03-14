@@ -1,26 +1,15 @@
 from data.loader import DataLoader
 from models.lstm import LSTMTrader
+from config import TICKERS, FEATURES, SEQUENCE_LENGTH, DEFAULT_EPOCHS, DEFAULT_BATCH_SIZE, BASE_DIR
 import pandas as pd
 import numpy as np
 import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-TICKERS = [
-    "0050.TW", "0056.TW", "00878.TW", "00929.TW",
-    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2881.TW",
-    "2882.TW", "2891.TW", "2886.TW", "1301.TW", "1303.TW", "2002.TW",
-    "2884.TW", "2892.TW", "1216.TW", "2303.TW", "3711.TW", "2885.TW",
-    "2880.TW", "3231.TW", "3045.TW", "2883.TW", "5871.TW", "2887.TW",
-    "2395.TW", "2412.TW", "2890.TW", "5880.TW", "1101.TW", "2357.TW",
-    "2301.TW", "2912.TW", "1326.TW", "2603.TW", "2207.TW", "1304.TW",
-    "2324.TW", "6669.TW", "3034.TW", "4938.TW", "3037.TW", "2345.TW",
-    "2356.TW", "1590.TW", "5876.TW", "4904.TW", "2379.TW"
-]
 
 def prepare_data(loader, tickers, start_date, end_date):
     """抓取並處理多資產數據"""
@@ -63,29 +52,21 @@ def main():
 
     loader = DataLoader()
     tickers = TICKERS
+    features = FEATURES
 
-    features = [
-        'Open', 'Close', 'High', 'Low',
-        'Body_Size', 'Daily_Range',
-        'SMA_5', 'SMA_20', 'SMA_60', 'RSI',
-        'MACD', 'MACD_Signal', 'MACD_Hist',
-        'BB_Upper', 'BB_Lower', 'BB_Width', 'OBV',
-        'Vol_Change', 'TWII_Return', 'TWII_Volume', 'SP500_Return'
-    ]
-
-    train_start = (datetime.now() - pd.DateOffset(years=5)).strftime('%Y-%m-%d')
-    train_end = datetime.now().strftime('%Y-%m-%d')
+    train_start = (datetime.now() - pd.DateOffset(years=2)).strftime('%Y-%m-%d')
+    train_end = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
 
     print(f"\n[1] Fetching Data ({train_start} to {train_end})...")
     all_data_dict, df_train_combined = prepare_data(loader, tickers, train_start, train_end)
 
     print("\n[2] Checking for weekend retraining or loading existing model...")
-    trader = LSTMTrader(sequence_length=20, features=features)
+    trader = LSTMTrader(sequence_length=SEQUENCE_LENGTH, features=features)
 
     # retrain on Mondays or missing model
     if datetime.now().weekday() == 0 or not trader.load_model():
         print("Training model on latest data from scratch...")
-        trader.train(df_train_combined, epochs=20, batch_size=256)
+        trader.train(df_train_combined, epochs=DEFAULT_EPOCHS, batch_size=DEFAULT_BATCH_SIZE)
         trader.save_model()
     else:
         print("Using cached model weights. Skipping full training.")
@@ -101,21 +82,26 @@ def main():
 
         if not df_signals.empty:
             last_row = df_signals.iloc[-1]
-            # if signal exists
-            if last_row['Position'] != 0:
+            # if signal exists (use pd.notna to avoid NaN comparison issues)
+            if pd.notna(last_row['Position']) and last_row['Position'] != 0:
+                confidence = last_row.get('lstm_prob_smooth', np.nan)
+                if pd.isna(confidence):
+                    confidence = last_row.get('lstm_prob', 0.5)
+                if pd.isna(confidence):
+                    confidence = 0.5
                 latest_signals.append({
                     "Date": last_row['Date'].strftime('%Y-%m-%d'),
                     "Ticker": ticker,
                     "Close": float(last_row['Close']),
                     "Signal": "BUY" if last_row['Position'] == 1.0 else "SELL",
-                    "Confidence": float(last_row['lstm_prob_smooth'])
+                    "Confidence": float(confidence)
                 })
 
     # 按照信心度排序
     latest_signals = sorted(latest_signals, key=lambda x: x['Confidence'], reverse=True)
 
     # 輸出成 JSON 供其他系統或機器人讀取
-    output_path = "latest_signals.json"
+    output_path = os.path.join(BASE_DIR, "latest_signals.json")
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(latest_signals, f, ensure_ascii=False, indent=4)
 

@@ -1,4 +1,6 @@
 *.json
 *.pkl
 *.pth
+*.png
+report_reader.py
 **/__pycache__/

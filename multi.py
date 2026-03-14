@@ -1,26 +1,21 @@
+import json
+import gc
+import sys
+import warnings
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+
 from data.loader import DataLoader
 from engine.backtest import BacktestEngine
 from models.lstm import LSTMTrader
-import pandas as pd
-import numpy as np
-import warnings
-import sys
-from datetime import datetime
-import gc
+from config import (
+    TICKERS, FEATURES, INITIAL_CAPITAL, SEQUENCE_LENGTH,
+    DEFAULT_EPOCHS, DEFAULT_BATCH_SIZE,
+)
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-TICKERS = [
-    "0050.TW", "0056.TW", "00878.TW", "00929.TW",
-    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2881.TW",
-    "2882.TW", "2891.TW", "2886.TW", "1301.TW", "1303.TW", "2002.TW",
-    "2884.TW", "2892.TW", "1216.TW", "2303.TW", "3711.TW", "2885.TW",
-    "2880.TW", "3231.TW", "3045.TW", "2883.TW", "5871.TW", "2887.TW",
-    "2395.TW", "2412.TW", "2890.TW", "5880.TW", "1101.TW", "2357.TW",
-    "2301.TW", "2912.TW", "1326.TW", "2603.TW", "2207.TW", "1304.TW",
-    "2324.TW", "6669.TW", "3034.TW", "4938.TW", "3037.TW", "2345.TW",
-    "2356.TW", "1590.TW", "5876.TW", "4904.TW", "2379.TW"
-]
 
 def prepare_multi_asset_data(loader, tickers, start_date, end_date):
     """Fetches data for multiple assets and merges market indices."""
@@ -70,16 +65,9 @@ def run_for_year(test_year, enable_short=False):
     loader = DataLoader()
     tickers = TICKERS
     
-    features = [
-        'Open', 'Close', 'High', 'Low',
-        'Body_Size', 'Daily_Range', 'Volume',
-        'SMA_5', 'SMA_20', 'SMA_60', 'RSI', 
-        'MACD', 'MACD_Signal', 'MACD_Hist',
-        'BB_Upper', 'BB_Lower', 'BB_Width', 'OBV',
-        'Vol_Change', 'TWII_Return', 'TWII_Volume', 'SP500_Return'
-    ]
+    features = FEATURES
     
-    train_start = f"{test_year-5}-01-01"
+    train_start = f"{test_year-2}-01-01"
     train_end = f"{test_year-1}-12-31"
     
     test_buffer_start = f"{test_year-1}-06-01"
@@ -96,8 +84,8 @@ def run_for_year(test_year, enable_short=False):
     test_data_dict, _ = prepare_multi_asset_data(loader, tickers, test_buffer_start, test_end)
     
     print("\n--- Initializing and Training LSTM Model ---")
-    trader = LSTMTrader(sequence_length=20, features=features) 
-    trader.train(df_train_combined, epochs=20, batch_size=256)
+    trader = LSTMTrader(sequence_length=SEQUENCE_LENGTH, features=features) 
+    trader.train(df_train_combined, epochs=DEFAULT_EPOCHS, batch_size=DEFAULT_BATCH_SIZE)
     
     del df_train_combined
     gc.collect()
@@ -110,7 +98,6 @@ def run_for_year(test_year, enable_short=False):
         df_test = test_data_dict[ticker]
         df_signals_full = trader.generate_signals(df_test)
         
-        # FIX: Look-Ahead Bias (Shift Signal by 1 Day for Backtesting)
         df_signals_full['Position'] = df_signals_full['Position'].shift(1)
         df_signals_full['confidence'] = df_signals_full['confidence'].shift(1)
         
@@ -137,13 +124,18 @@ def run_for_year(test_year, enable_short=False):
     price_matrix.ffill(inplace=True)
     
     print(f"\n--- Starting Shared-Capital Backtest for {test_year} ---")
-    engine = BacktestEngine(initial_capital=1000000.0)
+    engine = BacktestEngine(initial_capital=INITIAL_CAPITAL)
     
     def ensemble_strategy(row, current_position, current_capital, current_price):
         action = None
         quantity = 0
         
-        if row.get('Position') == 1.0:
+        position = row.get('Position')
+        # Position 可能為 NaN（序列初始階段），需先檢查
+        if pd.isna(position):
+            return action, quantity
+        
+        if position == 1.0:
             if current_position < 0:
                 action = 'COVER'
                 quantity = abs(current_position)
@@ -152,7 +144,7 @@ def run_for_year(test_year, enable_short=False):
                 alloc = current_capital * 0.20 
                 quantity = int(alloc // current_price)
             
-        elif row.get('Position') == -1.0:
+        elif position == -1.0:
             if current_position > 0:
                 action = 'SELL'
                 quantity = current_position
@@ -173,7 +165,6 @@ def run_for_year(test_year, enable_short=False):
     print(f"Total Trades:    {metrics['Total_Trades']}")
     print(f"Total Fees Paid: ${metrics['Total_Fees_Paid']:,.2f}")
     
-    import json
     # 儲存每年的交易紀錄
     history = metrics['Trade_History']
     log_filename = f"multilog_{test_year}.json"

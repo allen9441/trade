@@ -1,7 +1,6 @@
 yfinance
 pandas
 numpy
-ta
 matplotlib
 scikit-learn
 torch
